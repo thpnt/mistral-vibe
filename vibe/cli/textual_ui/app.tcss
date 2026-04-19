@@ -780,6 +780,27 @@ StatusMessage {
     color: ansi_yellow;
 }
 
+.blocking-voice-status {
+    height: auto;
+    color: ansi_bright_black;
+    margin-bottom: 1;
+}
+
+.blocking-voice-status-active {
+    color: $mistral_orange;
+    text-style: bold;
+}
+
+.blocking-voice-status-success {
+    color: ansi_green;
+    text-style: bold;
+}
+
+.blocking-voice-status-error {
+    color: ansi_red;
+    text-style: bold;
+}
+
 .approval-tool-info-container {
     width: 100%;
     height: auto;

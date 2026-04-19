@@ -47,6 +47,7 @@ class ChatInputBody(VoiceManagerListener, Widget):
         history_file: Path | None = None,
         nuage_enabled: bool = False,
         voice_manager: VoiceManagerPort | None = None,
+        transcript_router: Callable[[str], bool] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -55,6 +56,7 @@ class ChatInputBody(VoiceManagerListener, Widget):
         self._nuage_enabled = nuage_enabled
         self._switching_mode = False
         self._voice_manager = voice_manager
+        self._transcript_router = transcript_router
         self._recording_indicator: RecordingIndicator | None = None
 
         if history_file:
@@ -248,6 +250,8 @@ class ChatInputBody(VoiceManagerListener, Widget):
             self._stop_recording_ui()
 
     def on_transcribe_text(self, text: str) -> None:
+        if self._transcript_router and self._transcript_router(text):
+            return
         if not self.input_widget:
             return
         self.input_widget.insert(text)

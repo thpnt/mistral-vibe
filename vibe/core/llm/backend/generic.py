@@ -235,6 +235,7 @@ class GenericBackend:
         max_tokens: int | None = None,
         tool_choice: StrToolChoice | AvailableTool | None = None,
         extra_headers: dict[str, str] | None = None,
+        response_format: Any | None = None,
         metadata: dict[str, str] | None = None,
     ) -> LLMChunk:
         api_key = (
@@ -258,6 +259,8 @@ class GenericBackend:
             api_key=api_key,
             thinking=model.thinking,
         )
+
+        del response_format
 
         headers = req.headers
         if extra_headers:

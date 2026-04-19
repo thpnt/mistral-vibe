@@ -6,6 +6,7 @@ from tests.conftest import build_test_vibe_config
 from vibe.core.config import (
     DEFAULT_TTS_MODELS,
     DEFAULT_TTS_PROVIDERS,
+    NarrationTone,
     TTSClient,
     TTSModelConfig,
     TTSProviderConfig,
@@ -28,6 +29,11 @@ class TestTTSConfigDefaults:
     def test_default_active_tts_model(self) -> None:
         config = build_test_vibe_config()
         assert config.active_tts_model == "voxtral-tts"
+
+    def test_default_tts_voice_uses_model_default(self) -> None:
+        config = build_test_vibe_config()
+        assert config.tts_voice == "default"
+        assert config.narration_tone == NarrationTone.NEUTRAL
 
 
 class TestGetActiveTTSModel:
@@ -61,6 +67,18 @@ class TestGetTTSProviderForModel:
         model = config.get_active_tts_model()
         with pytest.raises(ValueError, match="not found in configuration"):
             config.get_tts_provider_for_model(model)
+
+
+class TestGetTTSVoiceForModel:
+    def test_returns_model_voice_when_config_uses_default(self) -> None:
+        config = build_test_vibe_config()
+        model = config.get_active_tts_model()
+        assert config.get_tts_voice_for_model(model) == "gb_jane_neutral"
+
+    def test_returns_config_override_when_set(self) -> None:
+        config = build_test_vibe_config(tts_voice="custom-voice-id")
+        model = config.get_active_tts_model()
+        assert config.get_tts_voice_for_model(model) == "custom-voice-id"
 
 
 class TestTTSModelUniqueness:

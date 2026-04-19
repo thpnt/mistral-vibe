@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
-from typing import cast
+from typing import Any, cast
 
 from tests.mock.utils import mock_llm_chunk
 from vibe.core.types import LLMChunk, LLMMessage, Role
@@ -36,6 +36,7 @@ class FakeBackend:
         self._requests_messages: list[list[LLMMessage]] = []
         self._requests_extra_headers: list[dict[str, str] | None] = []
         self._requests_metadata: list[dict[str, str] | None] = []
+        self._requests_response_formats: list[Any | None] = []
         self._count_tokens_calls: list[list[LLMMessage]] = []
         self._token_counter = token_counter or self._default_token_counter
         self._exception_to_raise = exception_to_raise
@@ -70,6 +71,10 @@ class FakeBackend:
     def requests_metadata(self) -> list[dict[str, str] | None]:
         return self._requests_metadata
 
+    @property
+    def requests_response_formats(self) -> list[Any | None]:
+        return self._requests_response_formats
+
     @staticmethod
     def _default_token_counter(messages: Sequence[LLMMessage]) -> int:
         return 1
@@ -90,6 +95,7 @@ class FakeBackend:
         tool_choice,
         extra_headers,
         max_tokens,
+        response_format=None,
         metadata=None,
     ) -> LLMChunk:
         if self._exception_to_raise:
@@ -98,6 +104,7 @@ class FakeBackend:
         self._requests_messages.append(messages)
         self._requests_extra_headers.append(extra_headers)
         self._requests_metadata.append(metadata)
+        self._requests_response_formats.append(response_format)
 
         if self._streams:
             stream = self._streams.pop(0)

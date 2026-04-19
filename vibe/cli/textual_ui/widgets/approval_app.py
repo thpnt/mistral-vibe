@@ -10,6 +10,11 @@ from textual.containers import Container, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static
 
+from vibe.cli.textual_ui.blocking_voice_answers import ApprovalVoiceAction
+from vibe.cli.textual_ui.widgets.blocking_voice_status import (
+    BlockingVoiceStatus,
+    BlockingVoiceStatusWidget,
+)
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.tool_widgets import get_approval_widget
 from vibe.core.config import VibeConfig
@@ -61,15 +66,18 @@ class ApprovalApp(Container):
         tool_args: BaseModel,
         config: VibeConfig,
         required_permissions: list[RequiredPermission] | None = None,
+        blocking_voice_status: BlockingVoiceStatus = BlockingVoiceStatus.IDLE,
     ) -> None:
         super().__init__(id="approval-app")
         self.tool_name = tool_name
         self.tool_args = tool_args
         self.config = config
         self.required_permissions = required_permissions or []
+        self._blocking_voice_status = blocking_voice_status
         self.selected_option = 0
         self.content_container: Vertical | None = None
         self.title_widget: Static | None = None
+        self.voice_status_widget: BlockingVoiceStatusWidget | None = None
         self.tool_info_container: Vertical | None = None
         self.option_widgets: list[Static] = []
         self.help_widget: Static | None = None
@@ -92,6 +100,10 @@ class ApprovalApp(Container):
                 f"⚠ {self.tool_name} command", classes="approval-title"
             )
             yield self.title_widget
+            self.voice_status_widget = BlockingVoiceStatusWidget(
+                self._blocking_voice_status
+            )
+            yield self.voice_status_widget
 
             with VerticalScroll(classes="approval-tool-info-scroll"):
                 self.tool_info_container = Vertical(
@@ -202,6 +214,31 @@ class ApprovalApp(Container):
                         tool_name=self.tool_name, tool_args=self.tool_args
                     )
                 )
+
+    def submit_voice_action(self, action: ApprovalVoiceAction) -> bool:
+        match action:
+            case ApprovalVoiceAction.APPROVE_ONCE:
+                self.selected_option = 0
+                self._update_options()
+                self._handle_selection(0)
+            case ApprovalVoiceAction.APPROVE_ALWAYS:
+                self.selected_option = 1
+                self._update_options()
+                self._handle_selection(1)
+            case ApprovalVoiceAction.REJECT:
+                self.selected_option = 2
+                self._update_options()
+                self._handle_selection(2)
+        return True
+
+    def set_blocking_voice_status(self, status: BlockingVoiceStatus) -> None:
+        self._blocking_voice_status = status
+        if self.voice_status_widget is not None:
+            self.voice_status_widget.set_status(status)
+
+    @property
+    def supports_voice_approve_always(self) -> bool:
+        return True
 
     def on_blur(self, event: events.Blur) -> None:
         self.call_after_refresh(self.focus)

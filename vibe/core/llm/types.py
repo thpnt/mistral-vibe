@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
 import types
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from vibe.core.types import AvailableTool, LLMChunk, LLMMessage, StrToolChoice
 
@@ -35,6 +35,7 @@ class BackendLike(Protocol):
         max_tokens: int | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
+        response_format: Any | None = None,
         metadata: dict[str, str] | None = None,
     ) -> LLMChunk:
         """Complete a chat conversation using the specified model and provider.
