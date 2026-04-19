@@ -366,7 +366,6 @@ class NarrationTone(StrEnum):
     GLAZING = auto()
 
 
-class OtelExporterConfig(BaseModel):
 class OtelSpanExporterConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 

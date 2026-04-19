@@ -529,6 +529,7 @@ class VibeApp(App, VoiceManagerListener):  # noqa: PLR0904
             and self._blocking_voice_answer_interpreter is not None
         ):
             await self._blocking_voice_answer_interpreter.close()
+
     async def _watch_init_completion(self) -> None:
         """Show 'Initializing' loading indicator until background init finishes."""
         init_widget = None
@@ -2258,7 +2259,6 @@ class VibeApp(App, VoiceManagerListener):  # noqa: PLR0904
             self._make_default_blocking_voice_answer_interpreter()
         )
 
-    async def _show_voice_settings(self) -> None:
     async def _show_voice_settings(self, **kwargs: Any) -> None:
         if self._current_bottom_app == BottomApp.Voice:
             return
