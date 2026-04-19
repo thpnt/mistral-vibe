@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel
 from rich import print as rprint
+from textual import events
 from textual.app import WINDOWS, App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalGroup, VerticalScroll
@@ -40,6 +41,26 @@ from vibe.cli.plan_offer.decide_plan_offer import (
 )
 from vibe.cli.plan_offer.ports.whoami_gateway import WhoAmIGateway, WhoAmIPlanType
 from vibe.cli.terminal_setup import setup_terminal
+from vibe.cli.textual_ui.action_required_narration import (
+    format_active_question_narration,
+    format_approval_narration,
+    format_approval_voice_confirmation,
+    format_question_voice_confirmation,
+)
+from vibe.cli.textual_ui.blocking_voice_answer_interpreter import (
+    BlockingVoiceActionType,
+    BlockingVoiceAnswerInterpretation,
+    BlockingVoiceAnswerInterpreterPort,
+    build_approval_voice_context,
+    build_question_voice_context,
+    create_blocking_voice_answer_interpreter,
+)
+from vibe.cli.textual_ui.blocking_voice_answers import (
+    ApprovalVoiceAction,
+    MultiSelectQuestionVoiceAnswer,
+    QuestionVoiceAnswer,
+    collapse_voice_answer_text,
+)
 from vibe.cli.textual_ui.handlers.event_handler import EventHandler
 from vibe.cli.textual_ui.notifications import (
     NotificationContext,
@@ -49,6 +70,7 @@ from vibe.cli.textual_ui.notifications import (
 from vibe.cli.textual_ui.session_exit import print_session_resume_message
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.banner.banner import Banner
+from vibe.cli.textual_ui.widgets.blocking_voice_status import BlockingVoiceStatus
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
@@ -102,7 +124,11 @@ from vibe.cli.update_notifier import (
 )
 from vibe.cli.update_notifier.update import do_update
 from vibe.cli.voice_manager import VoiceManager, VoiceManagerPort
-from vibe.cli.voice_manager.voice_manager_port import TranscribeState
+from vibe.cli.voice_manager.voice_manager_port import (
+    RecordingStartError,
+    TranscribeState,
+    VoiceManagerListener,
+)
 from vibe.core.agent_loop import AgentLoop, TeleportError
 from vibe.core.agents import AgentProfile
 from vibe.core.audio_player.audio_player import AudioPlayer
@@ -251,7 +277,7 @@ class StartupOptions:
     show_resume_picker: bool = False
 
 
-class VibeApp(App):  # noqa: PLR0904
+class VibeApp(App, VoiceManagerListener):  # noqa: PLR0904
     ENABLE_COMMAND_PALETTE = False
     CSS_PATH = "app.tcss"
     PAUSE_GC_ON_SCROLL: ClassVar[bool] = True
@@ -288,6 +314,10 @@ class VibeApp(App):  # noqa: PLR0904
         narrator_manager: NarratorManagerPort | None = None,
         **kwargs: Any,
     ) -> None:
+        blocking_voice_answer_interpreter = cast(
+            BlockingVoiceAnswerInterpreterPort | None,
+            kwargs.pop("blocking_voice_answer_interpreter", None),
+        )
         super().__init__(**kwargs)
         self.scroll_sensitivity_y = 1.0
         self.agent_loop = agent_loop
@@ -346,9 +376,26 @@ class VibeApp(App):  # noqa: PLR0904
         self._narrator_manager: NarratorManagerPort = (
             narrator_manager or self._make_default_narrator_manager()
         )
+        self._blocking_voice_answer_interpreter = (
+            blocking_voice_answer_interpreter
+            or self._make_default_blocking_voice_answer_interpreter()
+        )
+        self._owns_blocking_voice_answer_interpreter = (
+            blocking_voice_answer_interpreter is None
+        )
 
         self._rewind_mode = False
         self._rewind_highlighted_widget: UserMessage | None = None
+        self._blocking_voice_transcript_parts: list[str] = []
+        self._blocking_voice_answer_generation, self._blocking_voice_answer_task = (
+            0,
+            None,
+        )
+        (
+            self._blocking_voice_status,
+            self._pending_blocking_voice_approval_confirmation,
+            self._pending_blocking_voice_question_confirmation,
+        ) = (BlockingVoiceStatus.IDLE, None, None)
 
     @property
     def config(self) -> VibeConfig:
@@ -378,6 +425,7 @@ class VibeApp(App):  # noqa: PLR0904
                 file_watcher_for_autocomplete_getter=self._is_file_watcher_enabled,
                 nuage_enabled=self.config.nuage_enabled,
                 voice_manager=self._voice_manager,
+                transcript_router=self._route_transcript_text,
             )
 
         with Horizontal(id="bottom-bar"):
@@ -388,6 +436,7 @@ class VibeApp(App):  # noqa: PLR0904
     async def on_mount(self) -> None:
         self.theme = "textual-ansi"
         self._terminal_notifier.restore()
+        self._voice_manager.add_listener(self)
 
         self._cached_messages_area = self.query_one("#messages")
         self._cached_chat = self.query_one("#chat", ChatScroll)
@@ -434,6 +483,16 @@ class VibeApp(App):  # noqa: PLR0904
 
         gc.collect()
         gc.freeze()
+
+    async def on_unmount(self) -> None:
+        self._voice_manager.remove_listener(self)
+        if self._blocking_voice_answer_task is not None:
+            self._blocking_voice_answer_task.cancel()
+        if (
+            self._owns_blocking_voice_answer_interpreter
+            and self._blocking_voice_answer_interpreter is not None
+        ):
+            await self._blocking_voice_answer_interpreter.close()
 
     def _process_initial_prompt(self) -> None:
         if self._teleport_on_start:
@@ -490,6 +549,9 @@ class VibeApp(App):  # noqa: PLR0904
     ) -> None:
         if self._pending_approval and not self._pending_approval.done():
             self._pending_approval.set_result((ApprovalResponse.YES, None))
+            await self._speak_pending_blocking_voice_approval_confirmation()
+            return
+        self._clear_pending_blocking_voice_approval_confirmation()
 
     async def on_approval_app_approval_granted_always_tool(
         self, message: ApprovalApp.ApprovalGrantedAlwaysTool
@@ -498,6 +560,9 @@ class VibeApp(App):  # noqa: PLR0904
 
         if self._pending_approval and not self._pending_approval.done():
             self._pending_approval.set_result((ApprovalResponse.YES, None))
+            await self._speak_pending_blocking_voice_approval_confirmation()
+            return
+        self._clear_pending_blocking_voice_approval_confirmation()
 
     async def on_approval_app_approval_rejected(
         self, message: ApprovalApp.ApprovalRejected
@@ -507,6 +572,9 @@ class VibeApp(App):  # noqa: PLR0904
                 get_user_cancellation_message(CancellationReason.OPERATION_CANCELLED)
             )
             self._pending_approval.set_result((ApprovalResponse.NO, feedback))
+            await self._speak_pending_blocking_voice_approval_confirmation()
+        else:
+            self._clear_pending_blocking_voice_approval_confirmation()
 
         if self._loading_widget and self._loading_widget.parent:
             await self._remove_loading_widget()
@@ -515,11 +583,27 @@ class VibeApp(App):  # noqa: PLR0904
         if self._pending_question and not self._pending_question.done():
             result = AskUserQuestionResult(answers=message.answers, cancelled=False)
             self._pending_question.set_result(result)
+            await self._speak_pending_blocking_voice_question_confirmation()
+            return
+        self._clear_pending_blocking_voice_question_confirmation()
 
     async def on_question_app_cancelled(self, message: QuestionApp.Cancelled) -> None:
+        self._clear_pending_blocking_voice_question_confirmation()
+        self._set_blocking_voice_status(BlockingVoiceStatus.IDLE)
         if self._pending_question and not self._pending_question.done():
             result = AskUserQuestionResult(answers=[], cancelled=True)
             self._pending_question.set_result(result)
+
+    async def on_question_app_active_question_changed(
+        self, message: QuestionApp.ActiveQuestionChanged
+    ) -> None:
+        self._clear_pending_blocking_voice_question_confirmation()
+        self._set_blocking_voice_status(BlockingVoiceStatus.WAITING_FOR_VOICE_ANSWER)
+        if self._pending_question is None or self._pending_question.done():
+            return
+        await self._narrator_manager.speak_action_required(
+            format_active_question_narration(message.question)
+        )
 
     def on_chat_text_area_feedback_key_pressed(
         self, message: ChatTextArea.FeedbackKeyPressed
@@ -530,6 +614,39 @@ class VibeApp(App):  # noqa: PLR0904
         self, message: ChatTextArea.NonFeedbackKeyPressed
     ) -> None:
         self._feedback_bar.hide()
+
+    def on_transcribe_state_change(self, state: TranscribeState) -> None:
+        if state == TranscribeState.RECORDING:
+            self._narrator_manager.cancel()
+            self._blocking_voice_answer_generation += 1
+            self._blocking_voice_transcript_parts.clear()
+            if self._blocking_voice_answer_task is not None:
+                self._blocking_voice_answer_task.cancel()
+                self._blocking_voice_answer_task = None
+            if self._has_active_blocking_prompt():
+                self._set_blocking_voice_status(BlockingVoiceStatus.RECORDING)
+            return
+
+        if state == TranscribeState.FLUSHING:
+            if self._has_active_blocking_prompt():
+                self._set_blocking_voice_status(BlockingVoiceStatus.TRANSCRIBING)
+            return
+
+        if state != TranscribeState.IDLE:
+            return
+
+        if not self._blocking_voice_transcript_parts:
+            if self._has_active_blocking_prompt():
+                self._set_blocking_voice_status(
+                    BlockingVoiceStatus.WAITING_FOR_VOICE_ANSWER
+                )
+            return
+
+        task = asyncio.create_task(
+            self._flush_blocking_voice_answer(self._blocking_voice_answer_generation)
+        )
+        self._blocking_voice_answer_task = task
+        task.add_done_callback(self._clear_blocking_voice_answer_task)
 
     def on_feedback_bar_feedback_given(
         self, message: FeedbackBar.FeedbackGiven
@@ -542,6 +659,256 @@ class VibeApp(App):  # noqa: PLR0904
         if self._loading_widget and self._loading_widget.parent:
             await self._loading_widget.remove()
             self._loading_widget = None
+
+    def _has_pending_approval(self) -> bool:
+        return self._pending_approval is not None and not self._pending_approval.done()
+
+    def _has_pending_question(self) -> bool:
+        return self._pending_question is not None and not self._pending_question.done()
+
+    def _has_active_blocking_prompt(self) -> bool:
+        return self._has_pending_approval() or self._has_pending_question()
+
+    def _set_blocking_voice_status(self, status: BlockingVoiceStatus) -> None:
+        self._blocking_voice_status = status
+
+        try:
+            approval_app = self.query_one(ApprovalApp)
+        except Exception:
+            approval_app = None
+        if approval_app is not None:
+            approval_app.set_blocking_voice_status(status)
+
+        try:
+            question_app = self.query_one(QuestionApp)
+        except Exception:
+            question_app = None
+        if question_app is not None:
+            question_app.set_blocking_voice_status(status)
+
+    def _route_transcript_text(self, text: str) -> bool:
+        if not self._has_active_blocking_prompt():
+            return False
+
+        self._route_blocking_transcript_chunk(text)
+        return True
+
+    def _route_blocking_transcript_chunk(self, text: str) -> None:
+        if not text:
+            return
+        self._blocking_voice_transcript_parts.append(text)
+
+    def _clear_blocking_voice_answer_task(self, task: asyncio.Task[None]) -> None:
+        if self._blocking_voice_answer_task is task:
+            self._blocking_voice_answer_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.warning("Blocking voice answer task failed", exc_info=True)
+
+    async def _flush_blocking_voice_answer(self, generation: int) -> None:
+        transcript = collapse_voice_answer_text(
+            "".join(self._blocking_voice_transcript_parts)
+        )
+        self._blocking_voice_transcript_parts.clear()
+        if not transcript:
+            if generation == self._blocking_voice_answer_generation:
+                self._set_blocking_voice_status(
+                    BlockingVoiceStatus.WAITING_FOR_VOICE_ANSWER
+                )
+            return
+
+        self._set_blocking_voice_status(BlockingVoiceStatus.INTERPRETING)
+
+        if self._has_pending_approval():
+            await self._resolve_blocking_approval_voice_answer(transcript, generation)
+            return
+
+        if self._has_pending_question():
+            await self._resolve_blocking_question_voice_answer(transcript, generation)
+
+    async def _resolve_blocking_approval_voice_answer(
+        self, transcript: str, generation: int
+    ) -> None:
+        if generation != self._blocking_voice_answer_generation:
+            return
+        if self._blocking_voice_answer_interpreter is None:
+            self._set_blocking_voice_status(BlockingVoiceStatus.UNRESOLVED)
+            return
+
+        try:
+            approval_app = self.query_one(ApprovalApp)
+        except Exception:
+            return
+
+        interpretation = await self._blocking_voice_answer_interpreter.interpret(
+            transcript=transcript,
+            context=build_approval_voice_context(approval_app.tool_name),
+        )
+        if generation != self._blocking_voice_answer_generation:
+            return
+
+        if (
+            action := self._validate_approval_voice_interpretation(
+                approval_app, interpretation
+            )
+        ) is None:
+            self._set_blocking_voice_status(BlockingVoiceStatus.UNRESOLVED)
+            return
+
+        self._pending_blocking_voice_approval_confirmation = (
+            format_approval_voice_confirmation(action)
+        )
+        self._set_blocking_voice_status(BlockingVoiceStatus.ACCEPTED)
+        if not approval_app.submit_voice_action(action):
+            self._clear_pending_blocking_voice_approval_confirmation()
+            self._set_blocking_voice_status(BlockingVoiceStatus.UNRESOLVED)
+
+    async def _resolve_blocking_question_voice_answer(
+        self, transcript: str, generation: int
+    ) -> None:
+        if generation != self._blocking_voice_answer_generation:
+            return
+        if self._blocking_voice_answer_interpreter is None:
+            self._set_blocking_voice_status(BlockingVoiceStatus.UNRESOLVED)
+            return
+
+        try:
+            question_app = self.query_one(QuestionApp)
+        except Exception:
+            return
+
+        interpretation = await self._blocking_voice_answer_interpreter.interpret(
+            transcript=transcript,
+            context=build_question_voice_context(question_app.active_question),
+        )
+        if generation != self._blocking_voice_answer_generation:
+            return
+
+        resolution = self._validate_question_voice_interpretation(
+            question_app.active_question, interpretation
+        )
+        if resolution is None:
+            self._set_blocking_voice_status(BlockingVoiceStatus.UNRESOLVED)
+            return
+
+        self._pending_blocking_voice_question_confirmation = (
+            format_question_voice_confirmation(question_app.active_question, resolution)
+        )
+        submitted = False
+        self._set_blocking_voice_status(BlockingVoiceStatus.ACCEPTED)
+        match resolution:
+            case QuestionVoiceAnswer(answer=answer_text, is_other=is_other):
+                submitted = question_app.submit_voice_answer(
+                    answer_text=answer_text, is_other=is_other
+                )
+            case MultiSelectQuestionVoiceAnswer(
+                selected_indices=selected_indices, other_text=other_text
+            ):
+                submitted = question_app.submit_voice_multi_select_answer(
+                    selected_indices=selected_indices, other_text=other_text
+                )
+        if not submitted:
+            self._clear_pending_blocking_voice_question_confirmation()
+            self._set_blocking_voice_status(BlockingVoiceStatus.UNRESOLVED)
+
+    def _validate_approval_voice_interpretation(
+        self,
+        approval_app: ApprovalApp,
+        interpretation: BlockingVoiceAnswerInterpretation,
+    ) -> ApprovalVoiceAction | None:
+        action: ApprovalVoiceAction | None = None
+        match interpretation.action_type:
+            case BlockingVoiceActionType.APPROVAL_ONCE:
+                action = ApprovalVoiceAction.APPROVE_ONCE
+            case BlockingVoiceActionType.APPROVAL_ALWAYS:
+                if approval_app.supports_voice_approve_always:
+                    action = ApprovalVoiceAction.APPROVE_ALWAYS
+            case BlockingVoiceActionType.REJECT:
+                action = ApprovalVoiceAction.REJECT
+            case _:
+                action = None
+
+        if (
+            interpretation.selected_option_labels
+            or interpretation.other_text is not None
+        ):
+            return None
+        return action
+
+    def _validate_question_voice_interpretation(
+        self, question: Question, interpretation: BlockingVoiceAnswerInterpretation
+    ) -> QuestionVoiceAnswer | MultiSelectQuestionVoiceAnswer | None:
+        selected_labels = interpretation.selected_option_labels
+        other_text = interpretation.other_text
+        validated_answer: (
+            QuestionVoiceAnswer | MultiSelectQuestionVoiceAnswer | None
+        ) = None
+
+        if selected_labels and other_text is not None:
+            return None
+
+        option_indices = {
+            option.label: idx for idx, option in enumerate(question.options)
+        }
+
+        match interpretation.action_type:
+            case BlockingVoiceActionType.SELECT_OPTIONS:
+                if other_text is not None or not selected_labels:
+                    return None
+                if any(label not in option_indices for label in selected_labels):
+                    return None
+
+                selected_indices = tuple(
+                    dict.fromkeys(option_indices[label] for label in selected_labels)
+                )
+                if not selected_indices:
+                    return None
+
+                if question.multi_select:
+                    validated_answer = MultiSelectQuestionVoiceAnswer(
+                        selected_indices=selected_indices
+                    )
+                elif len(selected_indices) == 1:
+                    validated_answer = QuestionVoiceAnswer(
+                        answer=selected_labels[0], is_other=False
+                    )
+            case BlockingVoiceActionType.OTHER_TEXT:
+                if question.hide_other or not other_text or selected_labels:
+                    return None
+                if question.multi_select:
+                    validated_answer = MultiSelectQuestionVoiceAnswer(
+                        selected_indices=(), other_text=other_text
+                    )
+                else:
+                    validated_answer = QuestionVoiceAnswer(
+                        answer=other_text, is_other=True
+                    )
+            case _:
+                validated_answer = None
+        return validated_answer
+
+    def _clear_pending_blocking_voice_approval_confirmation(self) -> None:
+        self._pending_blocking_voice_approval_confirmation = None
+
+    def _clear_pending_blocking_voice_question_confirmation(self) -> None:
+        self._pending_blocking_voice_question_confirmation = None
+
+    async def _speak_pending_blocking_voice_approval_confirmation(self) -> None:
+        confirmation = self._pending_blocking_voice_approval_confirmation
+        self._clear_pending_blocking_voice_approval_confirmation()
+        if confirmation is None:
+            return
+        await self._narrator_manager.speak_action_required(confirmation)
+
+    async def _speak_pending_blocking_voice_question_confirmation(self) -> None:
+        confirmation = self._pending_blocking_voice_question_confirmation
+        self._clear_pending_blocking_voice_question_confirmation()
+        if confirmation is None:
+            return
+        await self._narrator_manager.speak_action_required(confirmation)
 
     async def on_config_app_open_model_picker(
         self, _message: ConfigApp.OpenModelPicker
@@ -846,22 +1213,34 @@ class VibeApp(App):  # noqa: PLR0904
                 return (ApprovalResponse.YES, None)
 
         async with self._user_interaction_lock:
+            self._clear_pending_blocking_voice_approval_confirmation()
             self._pending_approval = asyncio.Future()
+            self._set_blocking_voice_status(
+                BlockingVoiceStatus.WAITING_FOR_VOICE_ANSWER
+            )
             self._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
             try:
                 with paused_timer(self._loading_widget):
                     await self._switch_to_approval_app(tool, args, required_permissions)
+                    await self._narrator_manager.speak_action_required(
+                        format_approval_narration(tool, args, required_permissions)
+                    )
                     result = await self._pending_approval
                 return result
             finally:
                 self._pending_approval = None
+                self._set_blocking_voice_status(BlockingVoiceStatus.IDLE)
                 await self._switch_to_input_app()
 
     async def _user_input_callback(self, args: BaseModel) -> BaseModel:
         question_args = cast(AskUserQuestionArgs, args)
 
         async with self._user_interaction_lock:
+            self._clear_pending_blocking_voice_question_confirmation()
             self._pending_question = asyncio.Future()
+            self._set_blocking_voice_status(
+                BlockingVoiceStatus.WAITING_FOR_VOICE_ANSWER
+            )
             self._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
             try:
                 with paused_timer(self._loading_widget):
@@ -870,6 +1249,7 @@ class VibeApp(App):  # noqa: PLR0904
                 return result
             finally:
                 self._pending_question = None
+                self._set_blocking_voice_status(BlockingVoiceStatus.IDLE)
                 await self._switch_to_input_app()
 
     async def _handle_turn_error(self) -> None:
@@ -1042,8 +1422,12 @@ class VibeApp(App):  # noqa: PLR0904
             feedback = str(
                 get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
             )
+            self._clear_pending_blocking_voice_approval_confirmation()
+            self._set_blocking_voice_status(BlockingVoiceStatus.IDLE)
             self._pending_approval.set_result((ApprovalResponse.NO, feedback))
         if self._pending_question and not self._pending_question.done():
+            self._clear_pending_blocking_voice_question_confirmation()
+            self._set_blocking_voice_status(BlockingVoiceStatus.IDLE)
             self._pending_question.set_result(
                 AskUserQuestionResult(answers=[], cancelled=True)
             )
@@ -1213,6 +1597,7 @@ class VibeApp(App):  # noqa: PLR0904
             await self.agent_loop.reload_with_initial_messages(base_config=base_config)
             await self._resolve_plan()
             self._narrator_manager.sync()
+            self._sync_blocking_voice_answer_interpreter()
 
             if self._banner:
                 self._banner.set_state(
@@ -1402,6 +1787,22 @@ class VibeApp(App):  # noqa: PLR0904
             telemetry_client=self.agent_loop.telemetry_client,
         )
 
+    def _make_default_blocking_voice_answer_interpreter(
+        self,
+    ) -> BlockingVoiceAnswerInterpreterPort | None:
+        return create_blocking_voice_answer_interpreter(self.config)
+
+    def _sync_blocking_voice_answer_interpreter(self) -> None:
+        if not self._owns_blocking_voice_answer_interpreter:
+            return
+        if self._blocking_voice_answer_interpreter is not None:
+            self.run_worker(
+                self._blocking_voice_answer_interpreter.close(), exclusive=False
+            )
+        self._blocking_voice_answer_interpreter = (
+            self._make_default_blocking_voice_answer_interpreter()
+        )
+
     async def _show_voice_settings(self) -> None:
         if self._current_bottom_app == BottomApp.Voice:
             return
@@ -1467,11 +1868,15 @@ class VibeApp(App):  # noqa: PLR0904
             tool_args=tool_args,
             config=self.config,
             required_permissions=required_permissions,
+            blocking_voice_status=self._blocking_voice_status,
         )
         await self._switch_from_input(approval_app, scroll=True)
 
     async def _switch_to_question_app(self, args: AskUserQuestionArgs) -> None:
-        await self._switch_from_input(QuestionApp(args=args), scroll=True)
+        await self._switch_from_input(
+            QuestionApp(args=args, blocking_voice_status=self._blocking_voice_status),
+            scroll=True,
+        )
 
     async def _switch_to_input_app(self) -> None:
         if self._chat_input_container:
@@ -1846,6 +2251,25 @@ class VibeApp(App):  # noqa: PLR0904
             self.call_after_refresh(chat.anchor)
         self._focus_current_bottom_app()
 
+    def action_toggle_blocking_voice_recording(self) -> None:
+        if self._current_bottom_app not in {BottomApp.Approval, BottomApp.Question}:
+            return
+
+        if not self._voice_manager.is_enabled:
+            return
+
+        match self._voice_manager.transcribe_state:
+            case TranscribeState.IDLE:
+                self._blocking_voice_transcript_parts.clear()
+                try:
+                    self._voice_manager.start_recording()
+                except RecordingStartError as error:
+                    self.notify(str(error), severity="warning")
+            case TranscribeState.RECORDING:
+                self.run_worker(self._voice_manager.stop_recording(), exclusive=False)
+            case TranscribeState.FLUSHING:
+                return
+
     async def on_history_load_more_requested(self, _: HistoryLoadMoreRequested) -> None:
         self._load_more.set_enabled(False)
         try:
@@ -2145,6 +2569,17 @@ class VibeApp(App):  # noqa: PLR0904
             copied_text = copy_selection_to_clipboard(self, show_toast=True)
             if copied_text is not None:
                 self.agent_loop.telemetry_client.send_user_copied_text(copied_text)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key != "ctrl+r":
+            return
+
+        if self._current_bottom_app not in {BottomApp.Approval, BottomApp.Question}:
+            return
+
+        event.prevent_default()
+        event.stop()
+        self.action_toggle_blocking_voice_recording()
 
     def on_app_blur(self, event: AppBlur) -> None:
         self._terminal_notifier.on_blur()

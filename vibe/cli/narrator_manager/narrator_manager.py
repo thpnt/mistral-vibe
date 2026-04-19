@@ -100,6 +100,20 @@ class NarratorManager:
             self._cancel_summary = cancel_summary
             self._set_state(NarratorState.SUMMARIZING)
 
+    async def speak_action_required(self, text: str) -> None:
+        self.cancel()
+        if not self._config_getter().narrator_enabled or self._tts_client is None:
+            return
+
+        speak_task = self._start_speak_task(text)
+        if speak_task is None:
+            return
+
+        try:
+            await speak_task
+        except asyncio.CancelledError:
+            pass
+
     def cancel(self) -> None:
         if self._cancel_summary is not None:
             self._cancel_summary()
@@ -124,7 +138,9 @@ class NarratorManager:
         if result is None:
             return NoopTurnSummary()
         backend, model = result
-        return TurnSummaryTracker(backend=backend, model=model)
+        return TurnSummaryTracker(
+            backend=backend, model=model, tone=config.narration_tone
+        )
 
     @staticmethod
     def _make_tts_client(config: VibeConfig) -> TTSClientPort | None:
@@ -133,7 +149,12 @@ class NarratorManager:
         try:
             model = config.get_active_tts_model()
             provider = config.get_tts_provider_for_model(model)
-            return make_tts_client(provider, model)
+            return make_tts_client(
+                provider,
+                model.model_copy(
+                    update={"voice": config.get_tts_voice_for_model(model)}
+                ),
+            )
         except (ValueError, KeyError) as exc:
             logger.error("Failed to initialize TTS client", exc_info=exc)
             return None
@@ -166,12 +187,23 @@ class NarratorManager:
         if result.summary is None:
             self._set_state(NarratorState.IDLE)
             return
-        if self._tts_client is not None:
-            self._speak_task = asyncio.create_task(self._speak_summary(result.summary))
-        else:
+        if self._start_speak_task(result.summary) is None:
             self._set_state(NarratorState.IDLE)
 
-    async def _speak_summary(self, text: str) -> None:
+    def _start_speak_task(self, text: str) -> asyncio.Task[None] | None:
+        if self._tts_client is None or not text.strip():
+            return None
+
+        speak_task = asyncio.create_task(self._speak_text(text))
+        self._speak_task = speak_task
+        speak_task.add_done_callback(self._clear_speak_task)
+        return speak_task
+
+    def _clear_speak_task(self, task: asyncio.Task[None]) -> None:
+        if self._speak_task is task:
+            self._speak_task = None
+
+    async def _speak_text(self, text: str) -> None:
         if self._tts_client is None:
             return
         try:

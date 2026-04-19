@@ -291,6 +291,14 @@ class TTSModelConfig(BaseModel):
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
 
 
+class NarrationTone(StrEnum):
+    NEUTRAL = auto()
+    PROFESSIONAL = auto()
+    WARM = auto()
+    CONCISE = auto()
+    GLAZING = auto()
+
+
 class OtelExporterConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -381,6 +389,8 @@ class VibeConfig(BaseSettings):
     context_warnings: bool = False
     voice_mode_enabled: bool = False
     narrator_enabled: bool = False
+    tts_voice: str = "default"
+    narration_tone: NarrationTone = NarrationTone.NEUTRAL
     active_transcribe_model: str = "voxtral-realtime"
     active_tts_model: str = "voxtral-tts"
     auto_approve: bool = False
@@ -630,6 +640,9 @@ class VibeConfig(BaseSettings):
         raise ValueError(
             f"TTS provider '{model.provider}' for TTS model '{model.name}' not found in configuration."
         )
+
+    def get_tts_voice_for_model(self, model: TTSModelConfig) -> str:
+        return model.voice if self.tts_voice == "default" else self.tts_voice
 
     @classmethod
     def settings_customise_sources(

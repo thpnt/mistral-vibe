@@ -46,6 +46,7 @@ class ChatInputContainer(Vertical):
         file_watcher_for_autocomplete_getter: Callable[[], bool] | None = None,
         nuage_enabled: bool = False,
         voice_manager: VoiceManagerPort | None = None,
+        transcript_router: Callable[[str], bool] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -59,6 +60,7 @@ class ChatInputContainer(Vertical):
         )
         self._nuage_enabled = nuage_enabled
         self._voice_manager = voice_manager
+        self._transcript_router = transcript_router
 
         self._completion_manager = MultiCompletionManager([
             SlashCommandController(CommandCompleter(self._get_slash_entries), self),
@@ -94,6 +96,7 @@ class ChatInputContainer(Vertical):
                 id="input-body",
                 nuage_enabled=self._nuage_enabled,
                 voice_manager=self._voice_manager,
+                transcript_router=self._transcript_router,
             )
 
             yield self._body

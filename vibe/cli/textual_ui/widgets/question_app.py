@@ -12,6 +12,10 @@ from textual.reactive import reactive
 from textual.widgets import Input
 
 from vibe.cli.textual_ui.ansi_markdown import AnsiMarkdown
+from vibe.cli.textual_ui.widgets.blocking_voice_status import (
+    BlockingVoiceStatus,
+    BlockingVoiceStatusWidget,
+)
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
 
@@ -49,10 +53,21 @@ class QuestionApp(Container):
     class Cancelled(Message):
         pass
 
-    def __init__(self, args: AskUserQuestionArgs) -> None:
+    class ActiveQuestionChanged(Message):
+        def __init__(self, question_idx: int, question: Question) -> None:
+            super().__init__()
+            self.question_idx = question_idx
+            self.question = question
+
+    def __init__(
+        self,
+        args: AskUserQuestionArgs,
+        blocking_voice_status: BlockingVoiceStatus = BlockingVoiceStatus.IDLE,
+    ) -> None:
         super().__init__(id="question-app")
         self.args = args
         self.questions = args.questions
+        self._blocking_voice_status = blocking_voice_status
 
         self.answers: dict[int, tuple[str, bool]] = {}
         self.multi_selections: dict[int, set[int]] = {}
@@ -60,16 +75,22 @@ class QuestionApp(Container):
 
         self.option_widgets: list[NoMarkupStatic] = []
         self.title_widget: NoMarkupStatic | None = None
+        self.voice_status_widget: BlockingVoiceStatusWidget | None = None
         self.other_prefix: NoMarkupStatic | None = None
         self.other_input: Input | None = None
         self.other_static: NoMarkupStatic | None = None
         self.submit_widget: NoMarkupStatic | None = None
         self.help_widget: NoMarkupStatic | None = None
         self.tabs_widget: NoMarkupStatic | None = None
+        self._last_announced_question_idx: int | None = None
 
     @property
     def _current_question(self) -> Question:
         return self.questions[self.current_question_idx]
+
+    @property
+    def active_question(self) -> Question:
+        return self._current_question
 
     @property
     def _has_other(self) -> bool:
@@ -126,6 +147,10 @@ class QuestionApp(Container):
 
             self.title_widget = NoMarkupStatic("", classes="question-title")
             yield self.title_widget
+            self.voice_status_widget = BlockingVoiceStatusWidget(
+                self._blocking_voice_status
+            )
+            yield self.voice_status_widget
 
             for _ in range(self.MAX_OPTIONS):
                 widget = NoMarkupStatic("", classes="question-option")
@@ -153,9 +178,11 @@ class QuestionApp(Container):
     async def on_mount(self) -> None:
         self._update_display()
         self.focus()
+        self._notify_active_question_changed()
 
     def _watch_current_question_idx(self) -> None:
         self._update_display()
+        self._notify_active_question_changed()
 
     def _watch_selected_option(self) -> None:
         self._update_display()
@@ -167,6 +194,17 @@ class QuestionApp(Container):
         self._update_other_row()
         self._update_submit()
         self._update_help()
+
+    def _notify_active_question_changed(self) -> None:
+        question_idx = self.current_question_idx
+        if self._last_announced_question_idx == question_idx:
+            return
+        self._last_announced_question_idx = question_idx
+        self.post_message(
+            self.ActiveQuestionChanged(
+                question_idx=question_idx, question=self.questions[question_idx]
+            )
+        )
 
     def _update_tabs(self) -> None:
         if not self.tabs_widget or len(self.questions) <= 1:
@@ -494,6 +532,72 @@ class QuestionApp(Container):
                 Answer(question=q.question, answer=answer_text, is_other=is_other)
             )
         self.post_message(self.Answered(answers=result))
+
+    def submit_voice_answer(self, answer_text: str, is_other: bool) -> bool:
+        if self._current_question.multi_select:
+            return False
+
+        idx = self.current_question_idx
+        if is_other:
+            if self._current_question.hide_other:
+                return False
+            self.other_texts[idx] = answer_text
+            self.selected_option = self._other_option_idx
+        else:
+            option_idx = next(
+                (
+                    i
+                    for i, option in enumerate(self._current_question.options)
+                    if option.label == answer_text
+                ),
+                None,
+            )
+            if option_idx is None:
+                return False
+            self.selected_option = option_idx
+
+        self.answers[idx] = (answer_text, is_other)
+        self._update_display()
+        self._advance_or_submit()
+        return True
+
+    def submit_voice_multi_select_answer(
+        self, selected_indices: tuple[int, ...], other_text: str | None
+    ) -> bool:
+        if not self._current_question.multi_select:
+            return False
+
+        idx = self.current_question_idx
+        question = self._current_question
+        if other_text and question.hide_other:
+            return False
+
+        valid_indices = {
+            option_idx
+            for option_idx in selected_indices
+            if 0 <= option_idx < len(question.options)
+        }
+        if not valid_indices and not other_text:
+            return False
+
+        self.answers.pop(idx, None)
+        self.other_texts.pop(idx, None)
+
+        if other_text:
+            self.other_texts[idx] = other_text
+            valid_indices.add(self._other_option_idx)
+
+        self.multi_selections[idx] = valid_indices
+        self.selected_option = self._submit_option_idx
+        self._update_display()
+        self._save_current_answer()
+        self._advance_or_submit()
+        return True
+
+    def set_blocking_voice_status(self, status: BlockingVoiceStatus) -> None:
+        self._blocking_voice_status = status
+        if self.voice_status_widget is not None:
+            self.voice_status_widget.set_status(status)
 
     def on_blur(self, _event: events.Blur) -> None:
         self.call_after_refresh(self._refocus_if_needed)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, TypedDict
+from typing import TYPE_CHECKING, ClassVar, NotRequired, TypedDict
 
 from textual import events
 from textual.app import ComposeResult
@@ -20,6 +20,12 @@ class SettingDefinition(TypedDict):
     label: str
     type: str
     options: list[str]
+    display_values: NotRequired[dict[str, str]]
+
+
+VOICE_OPTIONS = ["default", "gb_jane_neutral"]
+VOICE_DISPLAY_VALUES = {"default": "Model default", "gb_jane_neutral": "Jane (Neutral)"}
+TONE_OPTIONS = ["neutral", "professional", "warm", "concise", "glazing"]
 
 
 class VoiceApp(Container):
@@ -62,6 +68,19 @@ class VoiceApp(Container):
                 "label": "Narrator (experimental)",
                 "type": "cycle",
                 "options": ["On", "Off"],
+            },
+            {
+                "key": "tts_voice",
+                "label": "Narrator voice",
+                "type": "cycle",
+                "options": list(VOICE_OPTIONS),
+                "display_values": VOICE_DISPLAY_VALUES,
+            },
+            {
+                "key": "narration_tone",
+                "label": "Narration tone",
+                "type": "cycle",
+                "options": list(TONE_OPTIONS),
             },
         ]
 
@@ -111,7 +130,8 @@ class VoiceApp(Container):
             cursor = "› " if is_selected else "  "
 
             label: str = setting["label"]
-            value: str = self._get_display_value(setting)
+            raw_value: str = self._get_display_value(setting)
+            value = setting.get("display_values", {}).get(raw_value, raw_value)
 
             text = f"{cursor}{label}: {value}"
 

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from mistralai.client.errors import SDKError
-from mistralai.client.models import AssistantMessage
+from mistralai.client.models import AssistantMessage, JSONSchema, ResponseFormat
 from mistralai.client.utils.retries import BackoffStrategy, RetryConfig
 import pytest
 import respx
@@ -658,6 +658,49 @@ class TestMistralBackendReasoningEffort:
             assistant_msg = converted_msgs[1]
             assert isinstance(assistant_msg, AssistantMessage)
             assert assistant_msg.content == "answer"
+
+    @pytest.mark.asyncio
+    async def test_complete_forwards_response_format(
+        self, backend: MistralBackend
+    ) -> None:
+        model = ModelConfig(
+            name="mistral-small-latest",
+            provider="mistral",
+            alias="mistral-small",
+            thinking="off",
+        )
+        messages = [LLMMessage(role=Role.user, content="hi")]
+        response_format = ResponseFormat(
+            type="json_schema",
+            json_schema=JSONSchema(
+                name="narration_speech", schema={"type": "object"}, strict=True
+            ),
+        )
+
+        with patch.object(backend, "_get_client") as mock_get_client:
+            mock_client = MagicMock()
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = '{"speech_text":"hello"}'
+            mock_response.choices[0].message.tool_calls = None
+            mock_response.usage.prompt_tokens = 10
+            mock_response.usage.completion_tokens = 5
+            mock_client.chat.complete_async = AsyncMock(return_value=mock_response)
+            mock_get_client.return_value = mock_client
+
+            await backend.complete(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                tools=None,
+                max_tokens=None,
+                tool_choice=None,
+                extra_headers=None,
+                response_format=response_format,
+            )
+
+            call_kwargs = mock_client.chat.complete_async.call_args.kwargs
+            assert call_kwargs["response_format"] == response_format
 
 
 class TestBuildHttpErrorBodyReading:

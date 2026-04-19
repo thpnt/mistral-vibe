@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import logging
+from typing import Any
 
 import pytest
 
@@ -15,15 +16,42 @@ from vibe.cli.turn_summary import (
     TurnSummaryTracker,
     create_narrator_backend,
 )
-from vibe.core.config import ModelConfig, ProviderConfig, VibeConfig
+from vibe.core.config import ModelConfig, NarrationTone, ProviderConfig, VibeConfig
 from vibe.core.llm.backend.mistral import MistralBackend
-from vibe.core.types import AssistantEvent, Backend, ToolStreamEvent, UserMessageEvent
+from vibe.core.types import (
+    AssistantEvent,
+    Backend,
+    LLMChunk,
+    ToolStreamEvent,
+    UserMessageEvent,
+)
 
 _TEST_MODEL = ModelConfig(name="test-model", provider="test", alias="test-model")
 
 
 def _noop_callback(result: TurnSummaryResult) -> None:
     pass
+
+
+def _joined_message_content(messages: list[Any]) -> str:
+    return "\n".join(str(message.content or "") for message in messages)
+
+
+class FailStructuredThenPassBackend(FakeBackend):
+    async def complete(self, *, response_format=None, **kwargs: Any) -> LLMChunk:
+        if response_format is not None:
+            raise RuntimeError("structured output unavailable")
+        return await super().complete(response_format=response_format, **kwargs)
+
+
+class AlwaysFailBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def complete(self, *, response_format=None, **kwargs: Any) -> LLMChunk:
+        self.calls += 1
+        raise RuntimeError("backend down")
 
 
 class TestCreateNarratorBackend:
@@ -145,6 +173,43 @@ class TestTurnSummaryTracker:
             backend=backend, model=_TEST_MODEL, on_summary=on_summary
         )
 
+    def test_professional_tone_uses_professional_prompt(self):
+        tracker = TurnSummaryTracker(
+            backend=FakeBackend(), model=_TEST_MODEL, tone=NarrationTone.PROFESSIONAL
+        )
+        messages = tracker._build_summary_messages("turn context")
+        assert len(messages) == 1
+        assert messages[0].content is not None
+        assert (
+            "Sound professional, composed, concise, and task-oriented."
+            in messages[0].content
+        )
+        assert "turn context" in messages[0].content
+
+    def test_unknown_tone_falls_back_to_default_prompt(self):
+        tracker = TurnSummaryTracker(
+            backend=FakeBackend(), model=_TEST_MODEL, tone="unknown-tone"
+        )
+        messages = tracker._build_summary_messages("turn context")
+        assert len(messages) == 1
+        assert messages[0].content is not None
+        assert (
+            "Sound direct, concise, task-oriented, and natural." in messages[0].content
+        )
+
+    def test_glazing_tone_uses_glazing_prompt(self):
+        tracker = TurnSummaryTracker(
+            backend=FakeBackend(), model=_TEST_MODEL, tone=NarrationTone.GLAZING
+        )
+        messages = tracker._build_summary_messages("turn context")
+        assert len(messages) == 1
+        assert messages[0].content is not None
+        assert (
+            "Use flattering and slightly dramatic wording toward the user"
+            in messages[0].content
+        )
+        assert "turn context" in messages[0].content
+
     @pytest.mark.asyncio
     async def test_track_accumulates_events(self):
         backend = FakeBackend(mock_llm_chunk(content="summary"))
@@ -157,7 +222,7 @@ class TestTurnSummaryTracker:
 
     @pytest.mark.asyncio
     async def test_end_turn_fires_summary(self):
-        backend = FakeBackend(mock_llm_chunk(content="the summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"the summary"}'))
         tracker = self._make_tracker(backend)
 
         tracker.start_turn("do something")
@@ -167,15 +232,15 @@ class TestTurnSummaryTracker:
 
         assert len(backend.requests_messages) == 1
         summary_msgs = backend.requests_messages[0]
-        assert len(summary_msgs) == 2
+        assert len(summary_msgs) == 1
         assert summary_msgs[0].role.value == "system"
-        assert summary_msgs[1].role.value == "user"
-        assert summary_msgs[1].content is not None
-        assert "do something" in summary_msgs[1].content
+        assert summary_msgs[0].content is not None
+        assert "do something" in summary_msgs[0].content
+        assert backend.requests_response_formats[0] is not None
 
     @pytest.mark.asyncio
     async def test_end_turn_clears_state(self):
-        backend = FakeBackend(mock_llm_chunk(content="summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"summary"}'))
         tracker = self._make_tracker(backend)
 
         tracker.start_turn("hello")
@@ -184,21 +249,21 @@ class TestTurnSummaryTracker:
 
     @pytest.mark.asyncio
     async def test_track_without_start_is_noop(self):
-        backend = FakeBackend(mock_llm_chunk(content="summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"summary"}'))
         tracker = self._make_tracker(backend)
         tracker.track(AssistantEvent(content="ignored"))
         assert tracker._data is None
 
     @pytest.mark.asyncio
     async def test_end_turn_without_start_is_noop(self):
-        backend = FakeBackend(mock_llm_chunk(content="summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"summary"}'))
         tracker = self._make_tracker(backend)
         tracker.end_turn()
         assert len(backend.requests_messages) == 0
 
     @pytest.mark.asyncio
     async def test_end_turn_after_cancel_is_noop(self):
-        backend = FakeBackend(mock_llm_chunk(content="summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"summary"}'))
         tracker = self._make_tracker(backend)
         tracker.start_turn("hello")
         tracker.cancel_turn()
@@ -208,7 +273,9 @@ class TestTurnSummaryTracker:
 
     @pytest.mark.asyncio
     async def test_on_summary_callback_called(self):
-        backend = FakeBackend(mock_llm_chunk(content="the summary text"))
+        backend = FakeBackend(
+            mock_llm_chunk(content='{"speech_text":"the summary text"}')
+        )
         received: list[TurnSummaryResult] = []
 
         def capture(result: TurnSummaryResult) -> None:
@@ -225,8 +292,50 @@ class TestTurnSummaryTracker:
         assert received[0].generation == tracker.generation
 
     @pytest.mark.asyncio
+    async def test_invalid_json_falls_back_to_raw_text(self):
+        backend = FakeBackend([
+            [mock_llm_chunk(content="{not json}")],
+            [mock_llm_chunk(content="fallback speech")],
+        ])
+        received: list[TurnSummaryResult] = []
+
+        def capture(result: TurnSummaryResult) -> None:
+            received.append(result)
+
+        tracker = self._make_tracker(backend, on_summary=capture)
+        tracker.start_turn("hello")
+        tracker.end_turn()
+        await asyncio.sleep(0.2)
+
+        assert len(received) == 1
+        assert received[0].summary == "fallback speech"
+        assert len(backend.requests_response_formats) == 2
+        assert backend.requests_response_formats[0] is not None
+        assert backend.requests_response_formats[1] is None
+
+    @pytest.mark.asyncio
+    async def test_structured_error_falls_back_to_raw_text(self):
+        backend = FailStructuredThenPassBackend(
+            mock_llm_chunk(content="fallback speech")
+        )
+        received: list[TurnSummaryResult] = []
+
+        def capture(result: TurnSummaryResult) -> None:
+            received.append(result)
+
+        tracker = self._make_tracker(backend, on_summary=capture)
+        tracker.start_turn("hello")
+        tracker.end_turn()
+        await asyncio.sleep(0.2)
+
+        assert len(received) == 1
+        assert received[0].summary == "fallback speech"
+        assert len(backend.requests_response_formats) == 1
+        assert backend.requests_response_formats[0] is None
+
+    @pytest.mark.asyncio
     async def test_backend_error_calls_callback_with_none(self):
-        backend = FakeBackend(exception_to_raise=RuntimeError("backend down"))
+        backend = AlwaysFailBackend()
         received: list[TurnSummaryResult] = []
 
         def capture(result: TurnSummaryResult) -> None:
@@ -239,10 +348,11 @@ class TestTurnSummaryTracker:
 
         assert len(received) == 1
         assert received[0].summary is None
+        assert backend.calls == 2
 
     @pytest.mark.asyncio
     async def test_backend_error_logged_no_crash(self, caplog):
-        backend = FakeBackend(exception_to_raise=RuntimeError("backend down"))
+        backend = AlwaysFailBackend()
         tracker = self._make_tracker(backend)
 
         with caplog.at_level(logging.WARNING, logger="vibe"):
@@ -250,11 +360,15 @@ class TestTurnSummaryTracker:
             tracker.end_turn()
             await asyncio.sleep(0.2)
 
+        assert (
+            "Structured turn summary generation failed; falling back to raw text"
+            in caplog.text
+        )
         assert "Turn summary generation failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_close_cancels_pending_tasks(self):
-        backend = FakeBackend(mock_llm_chunk(content="summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"summary"}'))
         tracker = self._make_tracker(backend)
 
         tracker.start_turn("hello")
@@ -266,7 +380,7 @@ class TestTurnSummaryTracker:
 
     @pytest.mark.asyncio
     async def test_error_only_turn_includes_error_in_summary(self):
-        backend = FakeBackend(mock_llm_chunk(content="error summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"error summary"}'))
         received: list[TurnSummaryResult] = []
 
         def capture(result: TurnSummaryResult) -> None:
@@ -280,8 +394,7 @@ class TestTurnSummaryTracker:
 
         assert cancel is not None
         assert len(backend.requests_messages) == 1
-        prompt_content = backend.requests_messages[0][1].content
-        assert prompt_content is not None
+        prompt_content = _joined_message_content(backend.requests_messages[0])
         assert "do something" in prompt_content
         assert "## Error" in prompt_content
         assert "Rate limit exceeded" in prompt_content
@@ -291,7 +404,9 @@ class TestTurnSummaryTracker:
 
     @pytest.mark.asyncio
     async def test_error_with_partial_response_includes_both(self):
-        backend = FakeBackend(mock_llm_chunk(content="partial error summary"))
+        backend = FakeBackend(
+            mock_llm_chunk(content='{"speech_text":"partial error summary"}')
+        )
         tracker = self._make_tracker(backend)
         tracker.start_turn("do something")
         tracker.track(AssistantEvent(content="partial response"))
@@ -300,8 +415,7 @@ class TestTurnSummaryTracker:
         await asyncio.sleep(0.1)
 
         assert len(backend.requests_messages) == 1
-        prompt_content = backend.requests_messages[0][1].content
-        assert prompt_content is not None
+        prompt_content = _joined_message_content(backend.requests_messages[0])
         assert "## Assistant Response" in prompt_content
         assert "partial response" in prompt_content
         assert "## Error" in prompt_content
@@ -309,7 +423,7 @@ class TestTurnSummaryTracker:
 
     @pytest.mark.asyncio
     async def test_stale_summary_has_old_generation(self):
-        backend = FakeBackend(mock_llm_chunk(content="stale summary"))
+        backend = FakeBackend(mock_llm_chunk(content='{"speech_text":"stale summary"}'))
         received: list[TurnSummaryResult] = []
 
         def capture(result: TurnSummaryResult) -> None:

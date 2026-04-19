@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator, Sequence
 import json
 import os
 import types
-from typing import TYPE_CHECKING, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 import httpx
 from mistralai.client import Mistral
@@ -264,6 +264,7 @@ class MistralBackend:
         max_tokens: int | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
+        response_format: Any | None = None,
         metadata: dict[str, str] | None = None,
     ) -> LLMChunk:
         try:
@@ -290,6 +291,7 @@ class MistralBackend:
                 http_headers=extra_headers,
                 metadata=metadata,
                 stream=False,
+                response_format=response_format,
                 reasoning_effort=reasoning_effort,
             )
 

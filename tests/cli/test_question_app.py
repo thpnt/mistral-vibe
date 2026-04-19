@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from vibe.core.tools.builtins.ask_user_question import (
@@ -279,6 +281,59 @@ class TestQuestionAppActions:
         assert app._get_other_text(1) == ""
 
 
+class TestActiveQuestionNarration:
+    def test_initial_active_question_posts_once(self, multi_question_args):
+        from vibe.cli.textual_ui.widgets.question_app import QuestionApp
+
+        app = QuestionApp(multi_question_args)
+        app.post_message = MagicMock()
+
+        app._notify_active_question_changed()
+        app._notify_active_question_changed()
+
+        assert app.post_message.call_count == 1
+        message = app.post_message.call_args[0][0]
+        assert isinstance(message, QuestionApp.ActiveQuestionChanged)
+        assert message.question_idx == 0
+        assert message.question == multi_question_args.questions[0]
+
+    def test_selection_changes_do_not_reannounce_same_question(
+        self, multi_question_args
+    ):
+        from vibe.cli.textual_ui.widgets.question_app import QuestionApp
+
+        app = QuestionApp(multi_question_args)
+        app.post_message = MagicMock()
+
+        app._notify_active_question_changed()
+        app.action_move_down()
+        app.action_move_up()
+        app._notify_active_question_changed()
+
+        assert app.post_message.call_count == 1
+
+    def test_switching_questions_posts_each_new_active_question(
+        self, multi_question_args
+    ):
+        from vibe.cli.textual_ui.widgets.question_app import QuestionApp
+
+        app = QuestionApp(multi_question_args)
+        app.post_message = MagicMock()
+
+        app._notify_active_question_changed()
+        app._switch_question(1)
+        app._switch_question(0)
+
+        assert app.post_message.call_count == 3
+        messages = [call.args[0] for call in app.post_message.call_args_list]
+        assert [message.question_idx for message in messages] == [0, 1, 0]
+        assert [message.question for message in messages] == [
+            multi_question_args.questions[0],
+            multi_question_args.questions[1],
+            multi_question_args.questions[0],
+        ]
+
+
 class TestMultiSelectOtherBehavior:
     def test_multi_select_other_does_not_advance_on_save(self, multi_select_args):
         from vibe.cli.textual_ui.widgets.question_app import QuestionApp
@@ -383,6 +438,75 @@ class TestMultiSelectOtherBehavior:
         app._save_current_answer()
 
         assert 0 not in app.answers
+
+
+class TestMultiSelectVoiceSubmission:
+    def test_submit_voice_multi_select_answer_saves_and_submits(
+        self, multi_select_args
+    ):
+        from vibe.cli.textual_ui.widgets.question_app import QuestionApp
+
+        app = QuestionApp(multi_select_args)
+        app.post_message = MagicMock()
+
+        submitted = app.submit_voice_multi_select_answer((0, 2), None)
+
+        assert submitted is True
+        assert app.multi_selections[0] == {0, 2}
+        assert app.answers[0] == ("Auth, Logging", False)
+        assert app.selected_option == app._submit_option_idx
+
+        message = app.post_message.call_args[0][0]
+        assert isinstance(message, QuestionApp.Answered)
+        assert message.answers[0].answer == "Auth, Logging"
+        assert message.answers[0].is_other is False
+
+    def test_submit_voice_multi_select_answer_with_other_text(self, multi_select_args):
+        from vibe.cli.textual_ui.widgets.question_app import QuestionApp
+
+        app = QuestionApp(multi_select_args)
+        app.post_message = MagicMock()
+
+        submitted = app.submit_voice_multi_select_answer((1,), "Custom Feature")
+
+        assert submitted is True
+        assert app.multi_selections[0] == {1, app._other_option_idx}
+        assert app.other_texts[0] == "Custom Feature"
+        assert app.answers[0] == ("Caching, Custom Feature", True)
+
+        message = app.post_message.call_args[0][0]
+        assert isinstance(message, QuestionApp.Answered)
+        assert message.answers[0].answer == "Caching, Custom Feature"
+        assert message.answers[0].is_other is True
+
+    def test_submit_voice_multi_select_answer_replaces_existing_state(
+        self, multi_select_args
+    ):
+        from vibe.cli.textual_ui.widgets.question_app import QuestionApp
+
+        app = QuestionApp(multi_select_args)
+        app.post_message = MagicMock()
+        app.multi_selections[0] = {0, app._other_option_idx}
+        app.other_texts[0] = "Old Custom"
+        app.answers[0] = ("Auth, Old Custom", True)
+
+        submitted = app.submit_voice_multi_select_answer((2,), None)
+
+        assert submitted is True
+        assert app.multi_selections[0] == {2}
+        assert app.other_texts.get(0) is None
+        assert app.answers[0] == ("Logging", False)
+
+    def test_submit_voice_multi_select_answer_returns_false_for_invalid_empty(
+        self, multi_select_args
+    ):
+        from vibe.cli.textual_ui.widgets.question_app import QuestionApp
+
+        app = QuestionApp(multi_select_args)
+
+        submitted = app.submit_voice_multi_select_answer((), None)
+
+        assert submitted is False
 
 
 class TestSingleSelectOtherBehavior:

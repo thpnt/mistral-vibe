@@ -72,3 +72,10 @@ class FakeVoiceManager:
         self._transcribe_state = state
         for listener in self._listeners:
             listener.on_transcribe_state_change(state)
+
+    def emit_transcribe_text(self, text: str) -> None:
+        for listener in self._listeners:
+            listener.on_transcribe_text(text)
+
+    def set_transcribe_state(self, state: TranscribeState) -> None:
+        self._set_state(state)

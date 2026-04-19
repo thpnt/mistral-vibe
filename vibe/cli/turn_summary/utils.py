@@ -7,9 +7,9 @@ from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.types import BackendLike
 
 NARRATOR_MODEL = ModelConfig(
-    name="mistral-vibe-cli-fast",
+    name="ministral-3b-latest",
     provider="mistral",
-    alias="mistral-small",
+    alias="ministral-3b",
     input_price=0.1,
     output_price=0.3,
 )
